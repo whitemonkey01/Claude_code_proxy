@@ -1,15 +1,6 @@
 #!/usr/bin/env bash
 set -e
 
-# Resolve real script directory (works through nested npm/npx symlinks)
-SOURCE="${BASH_SOURCE[0]}"
-while [[ -L "$SOURCE" ]]; do
-    DIR="$(cd -P "$(dirname "$SOURCE")" && pwd)"
-    SOURCE="$(readlink "$SOURCE")"
-    [[ "$SOURCE" != /* ]] && SOURCE="$DIR/$SOURCE"
-done
-SCRIPT_DIR="$(cd -P "$(dirname "$SOURCE")" && pwd)"
-
 CONFIG_FILE="$HOME/.claude-providers"
 SETTINGS_FILE="$HOME/.claude/settings.json"
 PID_FILE="/tmp/provider-proxy.pid"
@@ -17,6 +8,14 @@ FAILOVER_PORT="${PROXY_FAILOVER_PORT:-8083}"
 
 mkdir -p "$HOME/.claude"
 touch "$CONFIG_FILE"
+
+SOURCE="${BASH_SOURCE[0]}"
+while [[ -L "$SOURCE" ]]; do
+    DIR="$(cd -P "$(dirname "$SOURCE")" && pwd)"
+    SOURCE="$(readlink "$SOURCE")"
+    [[ "$SOURCE" != /* ]] && SOURCE="$DIR/$SOURCE"
+done
+SCRIPT_DIR="$(cd -P "$(dirname "$SOURCE")" && pwd)"
 
 list_providers() {
     awk '/^\[.*\]$/ { gsub(/[\[\]]/, ""); print }' "$CONFIG_FILE"
@@ -88,7 +87,6 @@ _failover_start() {
     echo "Starting failover proxy on port $port..."
     nohup "$SCRIPT_DIR/key-failover-proxy" --port "$port" --upstream "$upstream" --keys "$api_keys" \
         > /tmp/key-failover-proxy.log 2>&1 &
-    local fpid=$!
     echo "$fpid" > "$fpid_file"
     local waited=0
     while [[ $waited -lt 20 ]]; do
@@ -107,6 +105,43 @@ _failover_start() {
     echo "Failover proxy failed to become ready within 20s."
     rm -f "$fpid_file"
     return 1
+}
+
+_write_proxy_env() {
+    local name="$1"
+    local env_dir="$HOME/.config/claude-code-proxy"
+    local env_file="$env_dir/.env"
+    local base_file="$env_dir/.env.base"
+    mkdir -p "$env_dir"
+
+    # Save base env on first call (clean template)
+    [[ -f "$env_file" && ! -f "$base_file" ]] && cp "$env_file" "$base_file"
+
+    local entries
+    entries=$(get_all_vars "$name" | grep '^PROXY_CONFIG_')
+
+    if [[ -z "$entries" ]]; then
+        # No PROXY_CONFIG_* — restore base env for previous provider's config
+        [[ -f "$base_file" ]] && cp "$base_file" "$env_file"
+        return 0
+    fi
+
+    # Start with base env, overlay PROXY_CONFIG_*
+    local tmp
+    tmp=$(mktemp)
+    cp "$base_file" "$tmp"
+    while IFS= read -r line; do
+        local k="${line%%=*}"
+        local v="${line#*=}"
+        local config_key="${k#PROXY_CONFIG_}"
+        if grep -q "^${config_key}=" "$tmp" 2>/dev/null; then
+            sed -i "s|^${config_key}=.*|${config_key}=\"${v}\"|" "$tmp"
+        else
+            echo "${config_key}=\"${v}\"" >> "$tmp"
+        fi
+    done <<< "$entries"
+    cp "$tmp" "$env_file"
+    rm -f "$tmp"
 }
 
 proxy_start() {
@@ -156,6 +191,9 @@ proxy_start() {
         fi
         rm -f "$PID_FILE"
     fi
+
+    # Write proxy config env vars (PROXY_CONFIG_*) to claude-code-proxy .env file
+    _write_proxy_env "$name"
 
     echo "Starting proxy for '$name'..."
     if [[ -n "$api_key_var" && -n "$api_key_val" ]]; then
@@ -438,7 +476,7 @@ switch_provider() {
         v="${v//\"/\\\"}"
         if [[ "$k" == "MODEL" ]]; then
             model="$v"
-        elif [[ "$k" != PROXY_START && "$k" != PROXY_STOP && "$k" != PROXY_KEY_NAME && "$k" != PROXY_API_KEY && "$k" != MODEL_HISTORY && "$k" != API_KEYS ]]; then
+        elif [[ "$k" != PROXY_START && "$k" != PROXY_STOP && "$k" != PROXY_KEY_NAME && "$k" != PROXY_API_KEY && "$k" != MODEL_HISTORY && "$k" != API_KEYS && "$k" != PROXY_CONFIG_* ]]; then
             if [[ "$k" == "ANTHROPIC_BASE_URL" && -n "$override_base_url" ]]; then
                 v="$override_base_url"
             elif [[ "$k" == "ANTHROPIC_API_KEY" && -n "$override_api_key" ]]; then
