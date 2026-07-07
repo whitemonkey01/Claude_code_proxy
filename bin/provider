@@ -1,0 +1,580 @@
+#!/usr/bin/env bash
+set -e
+
+# Resolve real script directory (works through npm symlinks)
+SOURCE="${BASH_SOURCE[0]}"
+while [[ -L "$SOURCE" ]]; do
+    DIR="$(cd -P "$(dirname "$SOURCE")" && pwd)"
+    SOURCE="$(readlink "$SOURCE")"
+done
+SCRIPT_DIR="$(cd -P "$(dirname "$SOURCE")" && pwd)"
+
+CONFIG_FILE="$HOME/.claude-providers"
+SETTINGS_FILE="$HOME/.claude/settings.json"
+PID_FILE="/tmp/provider-proxy.pid"
+FAILOVER_PORT="${PROXY_FAILOVER_PORT:-8083}"
+
+mkdir -p "$HOME/.claude"
+touch "$CONFIG_FILE"
+
+list_providers() {
+    awk '/^\[.*\]$/ { gsub(/[\[\]]/, ""); print }' "$CONFIG_FILE"
+}
+
+get_value() {
+    local provider="$1" key="$2"
+    awk -v p="[$provider]" -v k="$key" '
+        $0 == p { found=1; next }
+        found && /^\[.*\]$/ { exit }
+        found && index($0, k "=") == 1 {
+            sub(/^[^=]*=/, ""); print; exit
+        }
+    ' "$CONFIG_FILE"
+}
+
+get_all_vars() {
+    local provider="$1"
+    awk -v p="[$provider]" '
+        $0 == p { found=1; next }
+        found && /^\[.*\]$/ { exit }
+        found && /=/ { print }
+    ' "$CONFIG_FILE"
+}
+
+_failover_pid() {
+    local fpid_file="/tmp/key-failover-proxy-${FAILOVER_PORT}.pid"
+    if [[ -f "$fpid_file" ]]; then
+        local pid
+        pid=$(cat "$fpid_file")
+        if kill -0 "$pid" 2>/dev/null; then
+            echo "$pid"
+            return 0
+        fi
+        rm -f "$fpid_file"
+    fi
+    return 1
+}
+
+_failover_stop() {
+    local pid
+    pid=$(_failover_pid) || return 0
+    echo "Stopping failover proxy (PID $pid)..."
+    kill "$pid" 2>/dev/null
+    sleep 1
+    if kill -0 "$pid" 2>/dev/null; then
+        kill -9 "$pid" 2>/dev/null || true
+    fi
+    rm -f "/tmp/key-failover-proxy-${FAILOVER_PORT}.pid"
+}
+
+_failover_start() {
+    local name="$1"
+    local api_keys
+    api_keys=$(get_value "$name" "API_KEYS")
+    [[ -z "$api_keys" ]] && return 1
+    local IFS=','
+    read -ra key_arr <<< "$api_keys"
+    [[ ${#key_arr[@]} -lt 2 ]] && return 1
+    IFS=' '
+    local upstream port
+    upstream=$(get_value "$name" "ANTHROPIC_BASE_URL")
+    port="$FAILOVER_PORT"
+    local fpid_file="/tmp/key-failover-proxy-${port}.pid"
+    if _failover_pid >/dev/null; then
+        echo "Failover proxy already running."
+        return 0
+    fi
+    echo "Starting failover proxy on port $port..."
+    nohup "$SCRIPT_DIR/key-failover-proxy" --port "$port" --upstream "$upstream" --keys "$api_keys" \
+        > /tmp/key-failover-proxy.log 2>&1 &
+    local fpid=$!
+    echo "$fpid" > "$fpid_file"
+    local waited=0
+    while [[ $waited -lt 20 ]]; do
+        if curl -sf "http://127.0.0.1:${port}/health" >/dev/null 2>&1; then
+            echo "Failover proxy ready after ${waited}s (PID $fpid)."
+            return 0
+        fi
+        sleep 1
+        waited=$((waited + 1))
+        if ! kill -0 "$fpid" 2>/dev/null; then
+            echo "Failover proxy died during startup. Check /tmp/key-failover-proxy.log"
+            rm -f "$fpid_file"
+            return 1
+        fi
+    done
+    echo "Failover proxy failed to become ready within 20s."
+    rm -f "$fpid_file"
+    return 1
+}
+
+proxy_start() {
+    local name="$1"
+    if [[ -z "$name" ]]; then
+        name=$(detect_active_provider)
+    fi
+    if [[ -z "$name" ]]; then
+        echo "No active provider found."
+        return 1
+    fi
+
+    # Try failover proxy first (multi-key)
+    local api_keys
+    api_keys=$(get_value "$name" "API_KEYS")
+    if [[ -n "$api_keys" ]]; then
+        local IFS=','
+        read -ra key_arr <<< "$api_keys"
+        IFS=' '
+        if [[ ${#key_arr[@]} -ge 2 ]]; then
+            _failover_start "$name"
+            return $?
+        fi
+    fi
+
+    local cmd api_key_var api_key_val port
+    cmd=$(get_value "$name" "PROXY_START")
+    api_key_var=$(get_value "$name" "PROXY_KEY_NAME")
+    api_key_val=$(get_value "$name" "PROXY_API_KEY")
+    port=$(get_value "$name" "ANTHROPIC_BASE_URL" | grep -oP '\d+$' || echo "8787")
+
+    if [[ -z "$cmd" ]]; then
+        echo "No proxy configured for '$name'."
+        return 1
+    fi
+
+    # Kill any existing nim daemon that might hold the port
+    command -v nim &>/dev/null && fuser -k "${port}/tcp" 2>/dev/null || true
+
+    # Check if already running via PID_FILE
+    if [[ -f "$PID_FILE" ]]; then
+        local old_pid
+        old_pid=$(cat "$PID_FILE")
+        if kill -0 "$old_pid" 2>/dev/null; then
+            echo "Proxy already running (PID $old_pid)."
+            return 0
+        fi
+        rm -f "$PID_FILE"
+    fi
+
+    echo "Starting proxy for '$name'..."
+    if [[ -n "$api_key_var" && -n "$api_key_val" ]]; then
+        cmd="$api_key_var=$api_key_val $cmd"
+    fi
+    # Start in background with nohup
+    nohup bash -c "$cmd" > /tmp/provider-proxy.log 2>&1 &
+    local pid=$!
+    echo "$pid" > "$PID_FILE"
+    # Wait for it to be ready (probe health endpoint)
+    echo "Waiting for proxy to be ready..."
+    local waited=0
+    while [[ $waited -lt 90 ]]; do
+        if curl -sf "http://127.0.0.1:${port}/health" >/dev/null 2>&1 || curl -sf "http://127.0.0.1:${port}/healthz" >/dev/null 2>&1; then
+            echo "Proxy ready after ${waited}s (PID $pid)."
+            return 0
+        fi
+        sleep 2
+        waited=$((waited + 2))
+        if ! kill -0 "$pid" 2>/dev/null; then
+            echo "Proxy process died during startup. Check /tmp/provider-proxy.log"
+            rm -f "$PID_FILE"
+            return 1
+        fi
+    done
+    echo "Proxy failed to become ready within 90s. Check /tmp/provider-proxy.log"
+    rm -f "$PID_FILE"
+    return 1
+}
+
+proxy_stop() {
+    local name="$1"
+    if [[ -z "$name" ]]; then
+        name=$(detect_active_provider || true)
+    fi
+
+    _failover_stop
+
+    # If there's a stop command in config, run it
+    if [[ -n "$name" ]]; then
+        local stop_cmd
+        stop_cmd=$(get_value "$name" "PROXY_STOP")
+        if [[ -n "$stop_cmd" ]]; then
+            eval "$stop_cmd" 2>/dev/null || true
+        fi
+    fi
+
+    # Also kill tracked PID
+    if [[ -f "$PID_FILE" ]]; then
+        local pid
+        pid=$(cat "$PID_FILE")
+        if kill -0 "$pid" 2>/dev/null; then
+            echo "Stopping proxy (PID $pid)..."
+            kill "$pid" 2>/dev/null
+            sleep 1
+            if kill -0 "$pid" 2>/dev/null; then
+                kill -9 "$pid" 2>/dev/null || true
+            fi
+            echo "Proxy stopped."
+        fi
+        rm -f "$PID_FILE"
+        return 0
+    fi
+
+    # Fallback: try nim kill
+    if command -v nim &>/dev/null; then
+        nim kill 2>/dev/null && echo "Proxy stopped (nim daemon)."
+        return
+    fi
+    echo "No proxy running."
+}
+
+proxy_status() {
+    local fpid
+    fpid=$(_failover_pid) || true
+    if [[ -n "$fpid" ]]; then
+        echo "Failover proxy running (PID $fpid)"
+        echo "  Listening on http://localhost:$FAILOVER_PORT"
+    fi
+    if [[ -f "$PID_FILE" ]]; then
+        local pid
+        pid=$(cat "$PID_FILE")
+        if kill -0 "$pid" 2>/dev/null; then
+            echo "Proxy running (PID $pid)"
+            local port
+            port=$(get_value "$(detect_active_provider)" "ANTHROPIC_BASE_URL" 2>/dev/null | grep -oP '\d+$' || echo "8787")
+            echo "  Listening on http://localhost:$port"
+            return 0
+        else
+            echo "PID file exists but process not running (stale)."
+            rm -f "$PID_FILE"
+        fi
+    fi
+    if [[ -z "$fpid" ]]; then
+        if command -v nim &>/dev/null; then
+            nim status 2>/dev/null
+            return
+        fi
+        echo "No proxy running."
+    fi
+}
+
+detect_active_provider() {
+    local tracker="/tmp/.active-provider"
+    if [[ -f "$tracker" ]]; then
+        local stored
+        stored=$(cat "$tracker")
+        if list_providers | grep -qx "$stored"; then
+            echo "$stored"
+            return 0
+        fi
+        rm -f "$tracker"
+    fi
+    if [[ ! -f "$SETTINGS_FILE" ]]; then
+        return 1
+    fi
+    local prev_api_key
+    prev_api_key=$(grep -o '"ANTHROPIC_API_KEY": *"[^"]*"' "$SETTINGS_FILE" 2>/dev/null | head -1 | sed 's/.*: *"\(.*\)"/\1/')
+    if [[ -z "$prev_api_key" ]]; then
+        return 1
+    fi
+    while IFS= read -r p; do
+        local k
+        k=$(get_value "$p" "ANTHROPIC_API_KEY")
+        if [[ "$k" == "$prev_api_key" ]]; then
+            echo "$p"
+            return 0
+        fi
+    done < <(list_providers)
+    return 1
+}
+
+# --- provider commands ---
+add_provider() {
+    local name="$1"
+    if grep -qx "\[$name\]" "$CONFIG_FILE" 2>/dev/null; then
+        echo "Provider '$name' already exists. Use 'provider remove $name' first."
+        return 1
+    fi
+    read -r -p "API Key: " api_key
+    read -r -p "Base URL: " base_url
+    read -r -p "Model (or leave blank): " model
+    read -r -p "Needs proxy? (y/N): " needs_proxy
+
+    local more_keys=""
+    if [[ "$needs_proxy" =~ ^[nN] ]]; then
+        read -r -p "Add backup API keys for failover? (y/N): " more_keys
+    fi
+
+    local api_keys_list="$api_key"
+    if [[ "$more_keys" =~ ^[yY] ]]; then
+        while :; do
+            read -r -p "Additional API key (or blank to finish): " extra_key
+            [[ -z "$extra_key" ]] && break
+            api_keys_list="$api_keys_list,$extra_key"
+        done
+    fi
+
+    {
+        echo "[$name]"
+        if [[ "$api_keys_list" == *","* ]]; then
+            echo "API_KEYS=$api_keys_list"
+        else
+            echo "ANTHROPIC_API_KEY=$api_keys_list"
+        fi
+        echo "ANTHROPIC_BASE_URL=$base_url"
+        [[ -n "$model" ]] && echo "MODEL=$model"
+        if [[ "$needs_proxy" =~ ^[yY] ]]; then
+            local proxy_cmd proxy_key_name proxy_key_val
+            read -r -p "Proxy start command (default: ncp proxy): " proxy_cmd
+            proxy_cmd="${proxy_cmd:-nim proxy}"
+            read -r -p "API key env var name (e.g. NVIDIA_API_KEY): " proxy_key_name
+            if [[ -n "$proxy_key_name" ]]; then
+                read -r -p "Value for $proxy_key_name: " proxy_key_val
+                echo "PROXY_KEY_NAME=$proxy_key_name"
+                echo "PROXY_API_KEY=$proxy_key_val"
+            fi
+            echo "PROXY_START=$proxy_cmd"
+            echo "PROXY_STOP=nim kill"
+        fi
+        echo ""
+    } >> "$CONFIG_FILE"
+    echo "Saved provider '$name'."
+}
+
+remove_provider() {
+    local name="$1"
+    if ! grep -qx "\[$name\]" "$CONFIG_FILE" 2>/dev/null; then
+        echo "Provider '$name' not found."
+        return 1
+    fi
+    # Stop proxy if running for this provider
+    proxy_stop
+    rm -f /tmp/.active-provider
+    awk -v p="[$name]" '
+        $0 == p { skip=1; next }
+        skip && /^\[.*\]$/ { skip=0 }
+        skip { next }
+        { print }
+    ' "$CONFIG_FILE" > "${CONFIG_FILE}.tmp" && mv "${CONFIG_FILE}.tmp" "$CONFIG_FILE"
+    echo "Removed provider '$name'."
+}
+
+set_field() {
+    local name="$1" key="$2" value="$3"
+    if ! grep -qx "\[$name\]" "$CONFIG_FILE" 2>/dev/null; then
+        echo "Provider '$name' not found."
+        return 1
+    fi
+    local tmp
+    tmp=$(awk -v p="[$name]" -v k="$key" '
+        $0 == p { in_block=1 }
+        in_block && /^\[.*\]$/ && $0 != p { in_block=0 }
+        in_block && index($0, k "=") == 1 { next }
+        { print }
+    ' "$CONFIG_FILE")
+    echo "$tmp" | awk -v p="[$name]" -v l="$key=$value" '
+        $0 == p { print; print l; next }
+        { print }
+    ' > "$CONFIG_FILE"
+    echo "  $key = $value"
+}
+
+switch_provider() {
+    local name="$1"
+    local prev_name=""
+    prev_name=$(detect_active_provider || true)
+
+    local lines
+    mapfile -t lines < <(get_all_vars "$name")
+    if [[ ${#lines[@]} -eq 0 ]]; then
+        echo "Provider '$name' not found."
+        return 1
+    fi
+
+    # Stop proxy of previous provider if different
+    if [[ -n "$prev_name" && "$prev_name" != "$name" ]]; then
+        local prev_prev_api_keys
+        prev_prev_api_keys=$(get_value "$prev_name" "API_KEYS")
+        if [[ -n "$prev_prev_api_keys" ]]; then
+            proxy_stop 2>/dev/null || true
+        else
+            local prev_proxy
+            prev_proxy=$(get_value "$prev_name" "PROXY_START")
+            if [[ -n "$prev_proxy" ]]; then
+                echo "Stopping proxy for '$prev_name'..."
+                proxy_stop 2>/dev/null || true
+            fi
+        fi
+    fi
+
+    # Start proxy for new provider if needed
+    local new_proxy
+    new_proxy=$(get_value "$name" "PROXY_START")
+    if [[ -n "$new_proxy" ]]; then
+        proxy_start "$name" 2>/dev/null || true
+    fi
+
+    # Check for failover proxy (multi-key)
+    local api_keys override_base_url override_api_key
+    api_keys=$(get_value "$name" "API_KEYS")
+    if [[ -n "$api_keys" ]]; then
+        local IFS=','
+        read -ra key_arr <<< "$api_keys"
+        IFS=' '
+        if [[ ${#key_arr[@]} -ge 2 ]]; then
+            _failover_start "$name"
+            override_base_url="http://127.0.0.1:${FAILOVER_PORT}"
+            override_api_key="failover_proxy"
+        fi
+    fi
+
+    # Build settings.json
+    local model="" env_lines=""
+    local nl=$'\n'
+    for line in "${lines[@]}"; do
+        local k="${line%%=*}"
+        local v="${line#*=}"
+        v="${v//\\/\\\\}"
+        v="${v//\"/\\\"}"
+        if [[ "$k" == "MODEL" ]]; then
+            model="$v"
+        elif [[ "$k" != PROXY_START && "$k" != PROXY_STOP && "$k" != PROXY_KEY_NAME && "$k" != PROXY_API_KEY && "$k" != MODEL_HISTORY && "$k" != API_KEYS ]]; then
+            if [[ "$k" == "ANTHROPIC_BASE_URL" && -n "$override_base_url" ]]; then
+                v="$override_base_url"
+            elif [[ "$k" == "ANTHROPIC_API_KEY" && -n "$override_api_key" ]]; then
+                v="$override_api_key"
+            fi
+            env_lines+="        \"$k\": \"$v\",${nl}"
+        fi
+    done
+    env_lines+="        \"CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC\": \"1\"${nl}"
+
+    {
+        echo "{"
+        if [[ -n "$model" ]]; then
+            echo "    \"model\": \"$model\","
+        fi
+        echo "    \"env\": {"
+        printf "%s" "$env_lines"
+        echo "    },"
+        echo "    \"permissions\": {"
+        echo "        \"allow\": [],"
+        echo "        \"deny\": []"
+        echo "    }"
+        echo "}"
+    } > "$SETTINGS_FILE"
+
+    echo "$name" > /tmp/.active-provider
+    echo "Switched to provider '$name'"
+    printf "  %s\n" "${lines[@]}"
+}
+
+show_current() {
+    if [[ -f "$SETTINGS_FILE" ]]; then
+        echo "Current ~/.claude/settings.json:"
+        cat "$SETTINGS_FILE"
+    else
+        echo "No settings file found."
+    fi
+    proxy_status
+}
+
+show_help() {
+    cat <<EOF
+Usage: provider <command> [args]
+
+Providers:
+  add <name>          Add a new provider
+  remove <name>       Remove a saved provider
+  switch <name>       Switch to a saved provider
+  list                List all saved providers
+  current             Show current settings & proxy status
+  model <name> <m>    Set model and switch
+  set <name> <k> <v>  Change any field
+
+Proxy:
+  proxy start         Start proxy for active provider
+  proxy stop          Stop proxy
+  proxy status        Check proxy status
+  proxy restart       Restart proxy
+
+GUI:
+  gui                 Launch terminal GUI
+  help                Show this help
+
+Run with no arguments for interactive mode.
+EOF
+}
+
+interactive() {
+    local providers
+    mapfile -t providers < <(list_providers)
+    if [[ ${#providers[@]} -eq 0 ]]; then
+        echo "No providers saved. Let's add one first."
+        read -r -p "Provider name: " name
+        add_provider "$name"
+        exec "$0"
+        return
+    fi
+    echo "Select a provider to switch to:"
+    select name in "${providers[@]}" "Add new provider" "Quit"; do
+        case $name in
+            "Add new provider")
+                read -r -p "Provider name: " newname
+                add_provider "$newname"
+                exec "$0"
+                ;;
+            "Quit")
+                exit 0
+                ;;
+            "")
+                echo "Invalid selection."
+                ;;
+            *)
+                switch_provider "$name"
+                exit 0
+                ;;
+        esac
+    done
+}
+
+# ---- main ----
+cmd="${1:-interactive}"
+case "$cmd" in
+    add)      add_provider "${2:?Usage: provider add <name>}" ;;
+    remove)   remove_provider "${2:?Usage: provider remove <name>}" ;;
+    switch)   switch_provider "${2:?Usage: provider switch <name>}" ;;
+    model)
+        if [[ $# -lt 3 ]]; then echo "Usage: provider model <name> <model>"; exit 1; fi
+        name="$2"; shift 2
+        set_field "$name" "MODEL" "$*"
+        switch_provider "$name"
+        ;;
+    set)
+        if [[ $# -lt 4 ]]; then echo "Usage: provider set <name> <KEY> <value>"; exit 1; fi
+        name="$2" key="$3"; shift 3
+        set_field "$name" "$key" "$*"
+        ;;
+    list)     list_providers ;;
+    gui)      exec "$SCRIPT_DIR/provider-gui" ;;
+    current)  show_current ;;
+    proxy)
+        case "${2:-status}" in
+            start)   proxy_start ;;
+            stop)    proxy_stop ;;
+            status)  proxy_status ;;
+            restart) proxy_stop; proxy_start ;;
+            *)       echo "Usage: provider proxy {start|stop|status|restart}" ;;
+        esac
+        ;;
+    help|--help|-h) show_help ;;
+    interactive) interactive ;;
+    *)
+        if list_providers | grep -qx "$cmd"; then
+            switch_provider "$cmd"
+        else
+            echo "Unknown command: $cmd"
+            show_help
+            exit 1
+        fi
+        ;;
+esac

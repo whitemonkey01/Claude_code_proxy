@@ -1,0 +1,729 @@
+#!/usr/bin/env python3
+import curses
+import os
+import signal
+import subprocess
+import time
+
+CONFIG_FILE = os.path.expanduser("~/.claude-providers")
+SETTINGS_FILE = os.path.expanduser("~/.claude/settings.json")
+PID_FILE = "/tmp/provider-proxy.pid"
+
+PROXY_KEYS = {"PROXY_START", "PROXY_STOP", "PROXY_KEY_NAME", "PROXY_API_KEY"}
+FAILOVER_PORT = 8083
+
+def read_providers():
+    providers = {}
+    current = None
+    if not os.path.exists(CONFIG_FILE):
+        return providers
+    with open(CONFIG_FILE) as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            if line.startswith("[") and line.endswith("]"):
+                current = line[1:-1]
+                providers[current] = {}
+            elif current and "=" in line:
+                k, v = line.split("=", 1)
+                if k == "MODEL_HISTORY":
+                    providers[current][k] = [x.strip() for x in v.split(",") if x.strip()]
+                else:
+                    providers[current][k] = v
+    return providers
+
+def write_providers(providers):
+    with open(CONFIG_FILE, "w") as f:
+        for name, cfg in providers.items():
+            f.write(f"[{name}]\n")
+            for k, v in cfg.items():
+                if k == "MODEL_HISTORY":
+                    f.write(f"{k}={','.join(v)}\n")
+                else:
+                    f.write(f"{k}={v}\n")
+            f.write("\n")
+
+def add_model_to_history(providers, name, model):
+    history = providers[name].get("MODEL_HISTORY", [])
+    if model in history:
+        history.remove(model)
+    history.insert(0, model)
+    providers[name]["MODEL_HISTORY"] = history[:10]
+
+def get_keys(cfg):
+    s = cfg.get("API_KEYS", "")
+    return [k.strip() for k in s.split(",") if k.strip()] if s else []
+
+def use_failover(cfg):
+    return len(get_keys(cfg)) >= 2
+
+def write_settings(providers, name):
+    cfg = providers.get(name)
+    if not cfg:
+        return
+    env_lines = []
+    model = cfg.get("MODEL", "")
+    fo = use_failover(cfg)
+    for k, v in cfg.items():
+        if k in PROXY_KEYS or k == "MODEL_HISTORY" or k == "API_KEYS":
+            continue
+        vj = v.replace("\\", "\\\\").replace('"', '\\"')
+        if k == "MODEL":
+            model = v
+        elif k == "ANTHROPIC_BASE_URL" and fo:
+            env_lines.append(f'        "{k}": "http://127.0.0.1:{FAILOVER_PORT}"')
+        elif k == "ANTHROPIC_API_KEY":
+            env_lines.append(f'        "{k}": "failover_proxy"')
+        else:
+            env_lines.append(f'        "{k}": "{vj}"')
+    env_lines.append('        "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC": "1"')
+    env_body = ",\n".join(env_lines)
+    with open(SETTINGS_FILE, "w") as f:
+        if model:
+            f.write(f'{{\n    "model": "{model}",\n    "env": {{\n{env_body}\n    }},\n    "permissions": {{\n        "allow": [],\n        "deny": []\n    }}\n}}\n')
+        else:
+            f.write(f'{{\n    "env": {{\n{env_body}\n    }},\n    "permissions": {{\n        "allow": [],\n        "deny": []\n    }}\n}}\n')
+
+def failover_pid():
+    pf = f"/tmp/key-failover-proxy-{FAILOVER_PORT}.pid"
+    if not os.path.exists(pf):
+        return None
+    with open(pf) as f:
+        pid = int(f.read().strip())
+    try:
+        os.kill(pid, 0)
+        return pid
+    except OSError:
+        os.remove(pf)
+        return None
+
+def failover_start_cfg(cfg):
+    import urllib.request
+    keys_str = cfg.get("API_KEYS", "")
+    upstream = cfg.get("ANTHROPIC_BASE_URL", "")
+    if not keys_str or not upstream:
+        return "No keys or upstream configured"
+    if failover_pid():
+        return f"Already running (PID {failover_pid()})"
+    proxy_script = os.path.expanduser("~/key-failover-proxy")
+    with open("/tmp/key-failover-proxy.log", "w") as lf:
+        p = subprocess.Popen(
+            [proxy_script, "--port", str(FAILOVER_PORT), "--upstream", upstream, "--keys", keys_str],
+            stdout=lf, stderr=lf, preexec_fn=os.setsid,
+        )
+    pf = f"/tmp/key-failover-proxy-{FAILOVER_PORT}.pid"
+    with open(pf, "w") as f:
+        f.write(str(p.pid))
+    for _ in range(30):
+        if failover_pid():
+            try:
+                urllib.request.urlopen(f"http://127.0.0.1:{FAILOVER_PORT}/health", timeout=2)
+                return f"Failover ready (PID {p.pid})"
+            except: pass
+        else:
+            return "Failover proxy died"
+        import time; time.sleep(1)
+    return "Failover proxy not ready in 30s"
+
+def failover_stop_cfg():
+    pid = failover_pid()
+    if not pid:
+        return "No failover proxy running"
+    try:
+        os.killpg(os.getpgid(pid), signal.SIGTERM)
+        os.kill(pid, signal.SIGTERM)
+        import time; time.sleep(1)
+        if failover_pid():
+            os.kill(pid, signal.SIGKILL)
+    except: pass
+    pf = f"/tmp/key-failover-proxy-{FAILOVER_PORT}.pid"
+    if os.path.exists(pf):
+        os.remove(pf)
+    return "Failover proxy stopped"
+
+def proxy_pid():
+    if not os.path.exists(PID_FILE):
+        return None
+    with open(PID_FILE) as f:
+        pid = int(f.read().strip())
+    try:
+        os.kill(pid, 0)
+        return pid
+    except OSError:
+        os.remove(PID_FILE)
+        return None
+
+def proxy_start_cfg(cfg):
+    cmd = cfg.get("PROXY_START", "")
+    key_name = cfg.get("PROXY_KEY_NAME", "")
+    key_val = cfg.get("PROXY_API_KEY", "")
+    base_url = cfg.get("ANTHROPIC_BASE_URL", "")
+    if not cmd:
+        return "No proxy configured"
+    if proxy_pid():
+        return f"Already running (PID {proxy_pid()})"
+    if key_name and key_val:
+        cmd = f"{key_name}={key_val} {cmd}"
+    with open("/tmp/provider-proxy.log", "w") as lf:
+        p = subprocess.Popen(
+            ["bash", "-c", cmd],
+            stdout=lf, stderr=lf,
+            preexec_fn=os.setsid,
+        )
+    with open(PID_FILE, "w") as pf:
+        pf.write(str(p.pid))
+    # Wait for proxy to be ready
+    port = "8787"
+    if ":" in base_url:
+        port = base_url.split(":")[-1].rstrip("/")
+    import urllib.request
+    for _ in range(45):
+        if proxy_pid():
+            try:
+                urllib.request.urlopen(f"http://127.0.0.1:{port}/health", timeout=2)
+                return f"Started (PID {p.pid})"
+            except:
+                try:
+                    urllib.request.urlopen(f"http://127.0.0.1:{port}/healthz", timeout=2)
+                    return f"Started (PID {p.pid})"
+                except:
+                    pass
+        else:
+            return "Failed to start"
+        time.sleep(2)
+    return "Proxy failed to become ready within 90s"
+
+def proxy_stop_cfg():
+    failover_stop_cfg()
+    pid = proxy_pid()
+    if not pid:
+        return "No proxy running"
+    try:
+        os.killpg(os.getpgid(pid), signal.SIGTERM)
+        os.kill(pid, signal.SIGTERM)
+        time.sleep(1)
+        if proxy_pid():
+            os.kill(pid, signal.SIGKILL)
+    except:
+        pass
+    if os.path.exists(PID_FILE):
+        os.remove(PID_FILE)
+    return "Proxy stopped"
+
+def model_picker(std, title, items):
+    h, w = std.getmaxyx()
+    items = list(items)
+    if not items:
+        return None
+    box_h = min(len(items) + 4, h - 4, 20)
+    box_w = min(max(len(i) + 4 for i in items) + 6, w - 4, 72)
+    bx = (w - box_w) // 2
+    by = (h - box_h) // 2
+
+    sub = curses.newwin(box_h, box_w, by, bx)
+    sub.keypad(True)
+    sub.bkgd(" ", curses.A_REVERSE)
+    sub.box()
+    sub.addstr(0, 2, f" {title} ")
+    sub.addstr(box_h - 2, 2, "[arrows] nav  [Enter] select  [Esc] cancel", curses.A_DIM)
+
+    sel = 0
+    scroll = 0
+    vis = box_h - 3
+
+    while True:
+        for i in range(vis):
+            sub.addstr(2 + i, 2, " " * (box_w - 4))
+            idx = scroll + i
+            if idx < len(items):
+                marker = " > " if idx == sel else "   "
+                line = f"{marker}{items[idx]}"
+                if len(line) > box_w - 4:
+                    line = line[:box_w - 6] + ".."
+                attr = curses.A_REVERSE if idx == sel else 0
+                sub.addstr(2 + i, 2, line.ljust(box_w - 4), attr)
+        sub.refresh()
+
+        key = sub.getch()
+        if key == curses.KEY_UP and sel > 0:
+            sel -= 1
+            if sel < scroll:
+                scroll = sel
+        elif key == curses.KEY_DOWN and sel < len(items) - 1:
+            sel += 1
+            if sel >= scroll + vis:
+                scroll = sel - vis + 1
+        elif key in (ord("\n"), 13):
+            result = items[sel]
+            del sub; std.touchwin(); std.refresh(); return result
+        elif key == 27:
+            del sub; std.touchwin(); std.refresh(); return None
+
+def edit_dialog(std, title, prompt, default=""):
+    h, w = std.getmaxyx()
+    box_w = min(74, w - 4)
+    box_h = 7
+    bx = (w - box_w) // 2
+    by = (h - box_h) // 2
+
+    sub = curses.newwin(box_h, box_w, by, bx)
+    sub.keypad(True)
+    sub.bkgd(" ", curses.A_REVERSE)
+    sub.box()
+    sub.addstr(0, 2, f" {title} ")
+    sub.addstr(2, 2, prompt[:box_w - 4])
+    sub.addstr(4, 2, "[Enter] confirm  [Esc] cancel", curses.A_DIM)
+    sub.addstr(3, 2, " " * (box_w - 4))
+
+    chars = list(default[:box_w - 4])
+    cx = len(chars)
+    max_w = box_w - 4
+    curses.curs_set(1)
+    sub.refresh()
+
+    while True:
+        line = "".join(chars) + " " * (max_w - len(chars))
+        for i, ch in enumerate(line[:max_w]):
+            sub.addch(3, 2 + i, ch)
+        sub.move(3, 2 + min(cx, max_w - 1))
+        sub.refresh()
+
+        key = sub.getch()
+        if key in (ord("\n"), 13):
+            curses.curs_set(0); del sub; std.touchwin(); std.refresh(); return "".join(chars).strip()
+        if key == 27:
+            curses.curs_set(0); del sub; std.touchwin(); std.refresh(); return None
+        if key in (curses.KEY_BACKSPACE, 127, 8) and cx > 0:
+            cx -= 1; chars.pop(cx)
+        elif key == curses.KEY_DC and cx < len(chars):
+            chars.pop(cx)
+        elif key == curses.KEY_LEFT and cx > 0:
+            cx -= 1
+        elif key == curses.KEY_RIGHT and cx < len(chars):
+            cx += 1
+        elif key == curses.KEY_HOME:
+            cx = 0
+        elif key == curses.KEY_END:
+            cx = len(chars)
+        elif 32 <= key <= 126:
+            chars.insert(cx, chr(key)); cx += 1
+            if len(chars) > max_w:
+                chars = chars[:max_w]; cx = min(cx, max_w)
+
+def msg_box(std, title, text):
+    h, w = std.getmaxyx()
+    lines = text.split("\n")
+    box_h = min(len(lines) + 4, h - 4)
+    box_w = min(max(len(l) + 2 for l in lines) + 6, w - 4, 72)
+    bx = (w - box_w) // 2; by = (h - box_h) // 2
+    sub = curses.newwin(box_h, box_w, by, bx)
+    sub.bkgd(" ", curses.A_REVERSE); sub.box()
+    sub.addstr(0, 2, f" {title} ")
+    for i, l in enumerate(lines):
+        if 2 + i < box_h - 1:
+            sub.addstr(2 + i, 2, l[:box_w - 4])
+    sub.addstr(box_h - 2, 2, " Press any key "); sub.refresh(); sub.getch()
+    del sub; std.touchwin(); std.refresh()
+
+def confirm(std, title, text):
+    h, w = std.getmaxyx()
+    lines = text.split("\n")
+    box_h = min(len(lines) + 5, h - 4)
+    box_w = min(max(len(l) + 2 for l in lines) + 6, w - 4, 72)
+    bx = (w - box_w) // 2; by = (h - box_h) // 2
+    sub = curses.newwin(box_h, box_w, by, bx)
+    sub.bkgd(" ", curses.A_REVERSE); sub.box()
+    sub.addstr(0, 2, f" {title} ")
+    for i, l in enumerate(lines):
+        if 2 + i < box_h - 2:
+            sub.addstr(2 + i, 2, l[:box_w - 4])
+    sub.addstr(box_h - 3, 2, " [y] Yes  [n] No  "); sub.refresh()
+    while True:
+        k = sub.getch()
+        if k in (ord("y"), ord("Y")):
+            del sub; std.touchwin(); std.refresh(); return True
+        if k in (ord("n"), ord("N"), 27):
+            del sub; std.touchwin(); std.refresh(); return False
+
+def manage_keys(std, providers, name):
+    cfg = providers.get(name, {})
+    has_multi = "API_KEYS" in cfg
+    has_single = "ANTHROPIC_API_KEY" in cfg
+
+    if not has_multi and not has_single:
+        val = edit_dialog(std, "Add API Key", f"API Key for {name}:")
+        if val:
+            providers[name]["ANTHROPIC_API_KEY"] = val
+            write_providers(providers)
+        return
+
+    if has_single and not has_multi:
+        opts = ["[Edit current key]", "[Add backup key]", "[Cancel]"]
+        picked = model_picker(std, f"API Key for {name}", opts)
+        if picked == "[Edit current key]":
+            cur = cfg["ANTHROPIC_API_KEY"]
+            val = edit_dialog(std, "Edit API Key", f"Key for {name}:", cur)
+            if val:
+                providers[name]["ANTHROPIC_API_KEY"] = val
+                write_providers(providers)
+        elif picked == "[Add backup key]":
+            old = cfg.pop("ANTHROPIC_API_KEY")
+            val = edit_dialog(std, "Add Backup Key", f"Backup API key for {name}:")
+            if val:
+                providers[name]["API_KEYS"] = f"{old},{val}"
+                write_providers(providers)
+            else:
+                providers[name]["ANTHROPIC_API_KEY"] = old
+        return
+
+    while True:
+        keys_str = cfg.get("API_KEYS", "")
+        keys = [k.strip() for k in keys_str.split(",") if k.strip()]
+        opts = [f"  Key {i+1}: {k[:24]}..." for i, k in enumerate(keys)]
+        opts.append("─────────────")
+        opts.append("[Add another key]")
+        if len(keys) > 1:
+            opts.append("[Remove a key]")
+        opts.append("[Use single key]")
+        opts.append("[Done]")
+
+        picked = model_picker(std, f"Manage keys for {name}", opts)
+        if picked is None or picked == "[Done]":
+            break
+        if picked.startswith("\u2500"):
+            continue
+        if picked == "[Add another key]":
+            val = edit_dialog(std, "Add Key", f"New key for {name}:")
+            if val:
+                cfg["API_KEYS"] = f"{keys_str},{val}" if keys_str else val
+                write_providers(providers)
+        elif picked == "[Remove a key]":
+            ropts = [f"Remove: {k[:24]}..." for k in keys]
+            ropts.append("[Cancel]")
+            to_rm = model_picker(std, "Select key to remove", ropts)
+            if to_rm and to_rm != "[Cancel]":
+                idx = ropts.index(to_rm)
+                keys.pop(idx)
+                if len(keys) == 1:
+                    providers[name]["ANTHROPIC_API_KEY"] = keys[0]
+                    del providers[name]["API_KEYS"]
+                elif keys:
+                    providers[name]["API_KEYS"] = ",".join(keys)
+                else:
+                    del providers[name]["API_KEYS"]
+                write_providers(providers)
+        elif picked == "[Use single key]":
+            if keys:
+                providers[name]["ANTHROPIC_API_KEY"] = keys[0]
+                del providers[name]["API_KEYS"]
+                write_providers(providers)
+                msg_box(std, "Converted", f"Using single key:\n{keys[0][:24]}...")
+            break
+
+
+def main_loop(std):
+    curses.curs_set(0)
+    std.keypad(True)
+    try:
+        curses.mousemask(curses.ALL_MOUSE_EVENTS | curses.REPORT_MOUSE_POSITION)
+    except:
+        pass
+
+    providers = read_providers()
+    names = sorted(providers.keys())
+    sel = 0 if names else -1
+    scroll = 0
+
+    while True:
+        h, w = std.getmaxyx()
+        if h < 10 or w < 44:
+            std.clear()
+            std.addstr(0, 0, "Terminal too small (need 44x10)")
+            std.addstr(1, 0, "Press q to quit"); std.refresh()
+            while True:
+                if std.getch() == ord("q"): return
+            continue
+
+        std.clear()
+        title = " Provider Manager "
+        std.addstr(0, 0, " " + "=" * (w - 2), curses.A_REVERSE)
+        std.addstr(0, (w - len(title)) // 2, title, curses.A_REVERSE | curses.A_BOLD)
+
+        binds = "[arrows]nav [Enter]switch [m]model [k]keys [u]url [a]add [r]remove [p]roxy [q]quit"
+        if len(binds) > w - 2:
+            binds = "[arrows]nav [Enter]switch [m]model [k]keys [u]url [a]add [r]remove [p]roxy [q]quit"
+        try: std.addstr(1, (w - len(binds)) // 2, binds, curses.A_DIM)
+        except: pass
+
+        pane_w = max(24, w // 3)
+        list_h = h - 3
+
+        std.addstr(2, 1, " PROVIDERS ", curses.A_UNDERLINE | curses.A_BOLD)
+        if not names:
+            std.addstr(4, 2, "(no providers)")
+            std.addstr(5, 2, "Press [a] to add")
+        else:
+            for i in range(list_h - 1):
+                idx = scroll + i
+                if idx >= len(names):
+                    break
+                name = names[idx]
+                marker = " > " if idx == sel else "   "
+                attr = curses.A_REVERSE if idx == sel else 0
+                line = f"{marker}{name}"
+                if len(line) > pane_w - 2:
+                    line = line[:pane_w - 4] + ".."
+                try: std.addstr(3 + i, 1, line.ljust(pane_w - 1), attr)
+                except: pass
+
+        dx = pane_w
+        for i in range(2, h):
+            try: std.addstr(i, dx, "|")
+            except: pass
+
+        rx = dx + 2
+        if 0 <= sel < len(names):
+            n = names[sel]
+            cfg = providers.get(n, {})
+            cur_model = cfg.get("MODEL", "")
+            has_proxy = "PROXY_START" in cfg
+            pid = proxy_pid()
+
+            hdr = f" {n} "
+            if cur_model:
+                hdr += f"  [{cur_model}]"
+            y = 2
+            std.addstr(y, rx, hdr, curses.A_BOLD)
+            y += 2
+
+            api_key = cfg.get("ANTHROPIC_API_KEY", "")
+            api_keys_str = cfg.get("API_KEYS", "")
+            base_url = cfg.get("ANTHROPIC_BASE_URL", "")
+            if api_keys_str:
+                keys = [k.strip() for k in api_keys_str.split(",") if k.strip()]
+                first = keys[0][:16] + "..." if keys and len(keys[0]) > 20 else (keys[0] if keys else "")
+                sk = f"  API Keys ({len(keys)}): {first}"
+                fo = " [failover]" if len(keys) >= 2 else ""
+                if len(sk) > w - rx - 1:
+                    sk = sk[:w - rx - 4] + "..."
+                std.addstr(y, rx, sk + fo); y += 1
+            if api_key and not api_keys_str:
+                display = api_key[:27] + "..." if len(api_key) > 30 else api_key
+                std.addstr(y, rx, f"  API Key: {display}"); y += 1
+            if base_url:
+                std.addstr(y, rx, f"  Base URL: {base_url}"); y += 1
+            if cur_model:
+                std.addstr(y, rx, f"  Model: {cur_model}", curses.A_BOLD); y += 1
+
+            history = cfg.get("MODEL_HISTORY", [])
+            if history:
+                extra = history[1:]
+                if extra:
+                    label = f"  Saved: {', '.join(extra[:3])}"
+                    if len(extra) > 3:
+                        label += f" (+{len(extra)-3} more)"
+                    if len(label) > w - rx - 1:
+                        label = label[:w - rx - 4] + "..."
+                    std.addstr(y, rx, label, curses.A_DIM); y += 1
+
+            fpid = failover_pid()
+            if has_proxy or pid or fpid or use_failover(cfg):
+                parts = []
+                if pid:
+                    parts.append(f"Proxy: RUNNING (PID {pid})")
+                elif has_proxy:
+                    parts.append("Proxy: STOPPED")
+                if fpid:
+                    parts.append(f"Failover: RUNNING (PID {fpid})")
+                elif use_failover(cfg):
+                    parts.append("Failover: STOPPED")
+                if parts:
+                    label = "  " + " | ".join(parts)
+                    if len(label) > w - rx - 1:
+                        label = label[:w - rx - 4] + "..."
+                    attr = curses.A_BOLD if (pid or fpid) else 0
+                    std.addstr(y, rx, label, attr); y += 1
+
+            if not any([api_key, base_url, cur_model]):
+                std.addstr(y, rx, "  (empty provider)")
+
+            hint = "[m]odel [k]ey [u]rl [p]roxy [Enter]switch"
+            try: std.addstr(h - 2, rx, hint, curses.A_DIM)
+            except: pass
+
+        std.refresh()
+
+        key = std.getch()
+
+        if key == curses.KEY_UP and sel > 0:
+            sel -= 1
+            if sel < scroll: scroll = sel
+        elif key == curses.KEY_DOWN and sel < len(names) - 1:
+            sel += 1
+            if sel >= scroll + list_h - 1:
+                scroll = sel - list_h + 2
+        elif key in (ord("\n"), 13) and 0 <= sel < len(names):
+            n = names[sel]
+            cfg = providers.get(n, {})
+
+            # Stop previous proxy if switching away
+            if proxy_pid() or failover_pid():
+                proxy_stop_cfg()
+
+            write_settings(providers, n)
+
+            # Start proxy for new provider if needed
+            if "PROXY_START" in cfg:
+                result = proxy_start_cfg(cfg)
+                msg_box(std, "Proxy", result)
+            elif use_failover(cfg):
+                result = failover_start_cfg(cfg)
+                msg_box(std, "Failover", result)
+            msg_box(std, "Switched", f"Active provider set to:\n{n}")
+        elif key == curses.KEY_MOUSE:
+            try:
+                _, mx, my, _, bstate = curses.getmouse()
+                if bstate & curses.BUTTON1_CLICKED:
+                    if 1 <= mx < pane_w and 3 <= my < 3 + list_h - 1:
+                        idx = scroll + (my - 3)
+                        if 0 <= idx < len(names):
+                            sel = idx
+                            if sel < scroll: scroll = sel
+                            if sel >= scroll + list_h - 1: scroll = sel - list_h + 2
+                elif bstate & curses.BUTTON1_DOUBLE_CLICKED:
+                    if 1 <= mx < pane_w and 3 <= my < 3 + list_h - 1:
+                        idx = scroll + (my - 3)
+                        if 0 <= idx < len(names):
+                            n = names[idx]
+                            cfg = providers.get(n, {})
+                            if "PROXY_START" in cfg and not proxy_pid():
+                                proxy_start_cfg(cfg)
+                            elif use_failover(cfg) and not failover_pid():
+                                failover_start_cfg(cfg)
+                            write_settings(providers, n)
+                            msg_box(std, "Switched", f"Active provider set to:\n{n}")
+            except: pass
+        elif key == ord("m") and 0 <= sel < len(names):
+            n = names[sel]
+            history = providers[n].get("MODEL_HISTORY", [])
+            items = list(history)
+            cur = providers[n].get("MODEL", "")
+            if cur and cur not in items:
+                items.insert(0, cur)
+            items.append("[Enter new model]")
+            picked = model_picker(std, f"Models for {n}", items)
+            if picked is None:
+                continue
+            elif picked == "[Enter new model]":
+                val = edit_dialog(std, "New Model", f"Model for {n}:")
+                if val:
+                    old = providers[n].get("MODEL", "")
+                    if old and old != val:
+                        add_model_to_history(providers, n, old)
+                    providers[n]["MODEL"] = val
+                    write_providers(providers)
+                    write_settings(providers, n)
+                    msg_box(std, "Model Set", f"Model changed to:\n{val}")
+            else:
+                old = providers[n].get("MODEL", "")
+                if old and old != picked:
+                    add_model_to_history(providers, n, old)
+                providers[n]["MODEL"] = picked
+                write_providers(providers)
+                write_settings(providers, n)
+                msg_box(std, "Model Switched", f"Model changed to:\n{picked}")
+        elif key == ord("k") and 0 <= sel < len(names):
+            n = names[sel]
+            manage_keys(std, providers, n)
+        elif key == ord("u") and 0 <= sel < len(names):
+            n = names[sel]
+            cur = providers[n].get("ANTHROPIC_BASE_URL", "")
+            val = edit_dialog(std, "Edit Base URL", f"Base URL for {n}:", cur)
+            if val:
+                providers[n]["ANTHROPIC_BASE_URL"] = val
+                write_providers(providers)
+        elif key == ord("p"):
+            if 0 <= sel < len(names):
+                n = names[sel]
+                cfg = providers.get(n, {})
+                fpid = failover_pid()
+                pid = proxy_pid()
+                if fpid:
+                    result = failover_stop_cfg()
+                    msg_box(std, "Failover", result)
+                elif pid:
+                    result = proxy_stop_cfg()
+                    msg_box(std, "Proxy", result)
+                elif "PROXY_START" in cfg:
+                    result = proxy_start_cfg(cfg)
+                    msg_box(std, "Proxy", result)
+                elif use_failover(cfg):
+                    result = failover_start_cfg(cfg)
+                    msg_box(std, "Failover", result)
+                else:
+                    msg_box(std, "No Proxy", f"No proxy configured for '{n}'.")
+            else:
+                fpid = failover_pid()
+                pid = proxy_pid()
+                if pid or fpid:
+                    result = proxy_stop_cfg()
+                    msg_box(std, "Proxy", result)
+                else:
+                    msg_box(std, "Proxy", "No proxy running.\nSelect a provider with proxy config first.")
+        elif key == ord("a"):
+            n = edit_dialog(std, "Add Provider", "Provider name:")
+            if not n:
+                continue
+            providers[n] = {}
+            write_providers(providers)
+            names = sorted(providers.keys())
+            sel = names.index(n)
+            scroll = max(0, sel - list_h + 2)
+
+            val = edit_dialog(std, "API Key", f"API Key for {n}:")
+            if val: providers[n]["ANTHROPIC_API_KEY"] = val
+            val = edit_dialog(std, "Base URL", f"Base URL for {n}:")
+            if val: providers[n]["ANTHROPIC_BASE_URL"] = val
+            val = edit_dialog(std, "Model (opt)", f"Model for {n}:")
+            if val:
+                providers[n]["MODEL"] = val
+                add_model_to_history(providers, n, val)
+
+            needs = confirm(std, "Proxy?", f"Does '{n}' need a proxy?")
+            if not needs and confirm(std, "Backup Keys?", f"Add backup API keys for\nfailover?"):
+                all_keys = [providers[n].get("ANTHROPIC_API_KEY", "")]
+                while True:
+                    ek = edit_dialog(std, "Add Key", "Backup key (or blank to finish):")
+                    if not ek: break
+                    all_keys.append(ek)
+                if len(all_keys) >= 2:
+                    providers[n]["API_KEYS"] = ",".join(all_keys)
+            if needs:
+                cmd = edit_dialog(std, "Proxy Cmd", "Start command:", "claude-code-proxy")
+                if cmd:
+                    providers[n]["PROXY_START"] = cmd
+                key_n = edit_dialog(std, "Env Var", "API key env var:", "NVIDIA_API_KEY")
+                if key_n:
+                    providers[n]["PROXY_KEY_NAME"] = key_n
+                    key_v = edit_dialog(std, "Key Value", f"Value for {key_n}:")
+                    if key_v:
+                        providers[n]["PROXY_API_KEY"] = key_v
+                providers[n]["PROXY_STOP"] = "pkill -f claude-code-proxy"
+            write_providers(providers)
+            msg_box(std, "Added", f"Provider '{n}' added.")
+        elif key == ord("r"):
+            if 0 <= sel < len(names):
+                n = names[sel]
+                if confirm(std, "Remove", f"Remove provider '{n}'?"):
+                    proxy_stop_cfg()
+                    del providers[n]
+                    write_providers(providers)
+                    names = sorted(providers.keys())
+                    if not names: sel = -1; scroll = 0
+                    elif sel >= len(names): sel = len(names) - 1
+        elif key == ord("q"):
+            break
+
+if __name__ == "__main__":
+    curses.wrapper(main_loop)

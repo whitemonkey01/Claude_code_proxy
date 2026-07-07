@@ -1,0 +1,122 @@
+#!/usr/bin/env python3
+"""key-failover-proxy — reverse proxy that tries multiple API keys on auth errors.
+
+Usage:
+  key-failover-proxy --port 8083 --upstream https://api.example.com --keys k1,k2,k3
+
+Listens on 127.0.0.1:PORT, forwards all requests to UPSTREAM.
+On 401/403/429 from upstream, transparently retries with the next key.
+Handles SSE streaming (detects error in first event before forwarding).
+"""
+
+import json, os, sys, signal, argparse
+import requests
+from flask import Flask, Response, request, stream_with_context
+
+app = Flask(__name__, static_folder=None)
+CFG = {}
+
+def parse_args():
+    p = argparse.ArgumentParser(description="Key failover proxy")
+    p.add_argument("--port", "-p", type=int, default=8083)
+    p.add_argument("--upstream", "-u", required=True)
+    p.add_argument("--keys", "-k", required=True)
+    return p.parse_args()
+
+def setup():
+    args = parse_args()
+    CFG["upstream"] = args.upstream.rstrip("/")
+    CFG["keys"] = [k.strip() for k in args.keys.split(",") if k.strip()]
+    CFG["port"] = args.port
+    if not CFG["keys"]:
+        print("error: at least one key required", file=sys.stderr)
+        sys.exit(1)
+    pidfile = f"/tmp/key-failover-proxy-{args.port}.pid"
+    with open(pidfile, "w") as f:
+        f.write(str(os.getpid()))
+    def cleanup(signum=None, frame=None):
+        if os.path.exists(pidfile):
+            os.remove(pidfile)
+        sys.exit(0)
+    signal.signal(signal.SIGTERM, cleanup)
+    signal.signal(signal.SIGINT, cleanup)
+    print(f"key-failover-proxy: {len(CFG['keys'])} keys, upstream={CFG['upstream']}, port={CFG['port']}", file=sys.stderr)
+
+@app.route("/health")
+@app.route("/healthz")
+def health():
+    return {"status": "ok", "keys_total": len(CFG["keys"]), "upstream": CFG["upstream"]}
+
+@app.route("/", defaults={"path": ""})
+@app.route("/<path:path>", methods=["GET", "POST", "PUT", "DELETE", "PATCH", "OPTIONS"])
+def proxy(path):
+    url = f"{CFG['upstream']}/{path}"
+    body = request.get_data()
+    ct = request.headers.get("content-type", "application/json")
+
+    hdrs = {"content-type": ct}
+    for h in ["anthropic-version", "anthropic-beta", "accept"]:
+        v = request.headers.get(h)
+        if v:
+            hdrs[h] = v
+
+    is_stream = False
+    if body and request.method == "POST":
+        try:
+            is_stream = json.loads(body).get("stream", False)
+        except: pass
+
+    if is_stream:
+        return _proxy_stream(url, hdrs, body)
+    return _proxy_sync(url, hdrs, body, request.method)
+
+def _proxy_sync(url, hdrs, body, method="POST"):
+    for key in CFG["keys"]:
+        try:
+            h = {**hdrs, "x-api-key": key}
+            resp = requests.request(method, url, data=body, headers=h, timeout=60)
+            if resp.status_code in (401, 403, 429):
+                print(f"  key {key[:12]}... {resp.status_code}", file=sys.stderr)
+                continue
+            ct = resp.headers.get("content-type", "application/json")
+            return Response(resp.content, status=resp.status_code, content_type=ct)
+        except requests.RequestException as e:
+            print(f"  key {key[:12]}... error: {e}", file=sys.stderr)
+            continue
+    return Response(json.dumps({"error": "all API keys failed"}), status=503, content_type="application/json")
+
+def _proxy_stream(url, hdrs, body):
+    def gen():
+        for key in CFG["keys"]:
+            try:
+                h = {**hdrs, "x-api-key": key}
+                resp = requests.post(url, data=body, headers=h, stream=True, timeout=120)
+                if resp.status_code in (401, 403, 429):
+                    print(f"  key {key[:12]}... {resp.status_code}", file=sys.stderr)
+                    continue
+
+                evt_lines = []
+                for line in resp.iter_lines(decode_unicode=True):
+                    if line == "":
+                        break
+                    evt_lines.append(line)
+
+                first = "\n".join(evt_lines)
+                if "event: error" in first:
+                    print(f"  key {key[:12]}... error in SSE stream", file=sys.stderr)
+                    resp.close()
+                    continue
+
+                yield first + "\n\n"
+                for line in resp.iter_lines(decode_unicode=True):
+                    yield (line + "\n") if line else "\n"
+                return
+            except requests.RequestException as e:
+                print(f"  key {key[:12]}... error: {e}", file=sys.stderr)
+                continue
+        yield 'event: error\ndata: {"type":"error","error":{"type":"forbidden","message":"all API keys failed"}}\n\n'
+    return Response(stream_with_context(gen()), content_type="text/event-stream")
+
+if __name__ == "__main__":
+    setup()
+    app.run(host="127.0.0.1", port=CFG["port"], debug=False, threaded=True)

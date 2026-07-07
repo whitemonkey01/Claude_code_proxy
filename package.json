@@ -1,0 +1,27 @@
+{
+  "name": "claude-provider-manager",
+  "version": "1.0.0",
+  "description": "Multi-provider manager for Claude Code with automatic API key failover",
+  "bin": {
+    "provider": "./bin/provider",
+    "provider-gui": "./bin/provider-gui",
+    "key-failover-proxy": "./bin/key-failover-proxy"
+  },
+  "scripts": {
+    "postinstall": "node scripts/postinstall.js",
+    "install": "node scripts/postinstall.js"
+  },
+  "keywords": ["claude", "claude-code", "anthropic", "provider", "proxy", "failover"],
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/whitemonkey01/Claude_code_proxy.git"
+  },
+  "bugs": {
+    "url": "https://github.com/whitemonkey01/Claude_code_proxy/issues"
+  },
+  "homepage": "https://github.com/whitemonkey01/Claude_code_proxy#readme",
+  "engines": {
+    "node": ">=16"
+  }
+}
