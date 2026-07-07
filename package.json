@@ -1,8 +1,9 @@
 {
   "name": "claude-provider-manager",
-  "version": "1.0.0",
+  "version": "1.0.1",
   "description": "Multi-provider manager for Claude Code with automatic API key failover",
   "bin": {
+    "claude-provider-manager": "./bin/provider",
     "provider": "./bin/provider",
     "provider-gui": "./bin/provider-gui",
     "key-failover-proxy": "./bin/key-failover-proxy"
